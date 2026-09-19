@@ -25,6 +25,21 @@
               │  (Browser UI)  │
               └────────────────┘
 ```
+## 🎥 Live Dashboard Demo
+
+The following videos demonstrate the real-time AMR Fleet Coordination System, including fleet monitoring, live map visualization, robot status, task coordination, and dashboard operation.
+
+### 🖥️ AMR Fleet Dashboard
+
+[▶️ Watch Dashboard Demo](./demo/AMR_Fleet_Dashboard_Demo.mp4)
+
+### 🗺️ Live Map Visualization
+
+[▶️ Watch Live Map Demo](./demo/AMR_Fleet_Dashboard_Demo_live_map.mp4)
+
+### 🤖 Robot List & Fleet Monitoring
+
+[▶️ Watch Robot List Demo](./demo/AMR_Fleet_Dashboard_Demo_ROBOT_LIST.mp4)
 
 ## Components
 
