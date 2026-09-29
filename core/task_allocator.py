@@ -167,6 +167,13 @@ class TaskAllocator:
 
     # ── Charging re-routing ────────────────────────────────────────────────────
 
+    def requeue_task(self, task) -> None:
+        """Re-insert a released task back into the pending pool."""
+        if task and task not in self.pending_tasks and not task.completed:
+            task.assigned_to = None
+            self.pending_tasks.insert(0, task)
+            logger.info("Task %d requeued.", task.task_id)
+
     def route_to_charger(self, robot: Robot) -> None:
         """
         Strip the robot's current task (return it to pool) and mark

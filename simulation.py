@@ -3,17 +3,21 @@ simulation.py — Main orchestration engine for the AMR fleet.
 
 Tick loop (runs at TICK_RATE_HZ)
 ─────────────────────────────────
-  1. Task allocator assigns pending tasks to idle robots
-  2. Path planner plans / replans paths for robots that need them
-  3. Conflict resolver checks and resolves vertex/edge/deadlock conflicts
-  4. Each robot advances one step (battery, state machine, movement)
-  5. P2P network: robots broadcast position and intent
-  6. Statistics collected and pushed to the WebSocket bridge queue
+  1.  Task allocator assigns pending tasks to idle robots
+  2.  Path planner plans / replans paths for robots that need them
+  3.  Conflict resolver checks and resolves vertex/edge/deadlock conflicts
+  4.  Each robot advances one step (battery, state machine, movement)
+  5.  P2P network: robots broadcast position and intent
+  6.  Statistics collected and pushed to the WebSocket bridge queue
 
-Stop-and-wait baseline
-──────────────────────
-  When stop_and_wait=True every robot halts when any other robot is
-  within 2 cells, simulating the naive approach for benchmarking.
+  NEW — Advanced Layers
+  ─────────────────────
+  L1. Self-Healing Manager       — battery + failure recovery
+  L2. Federated Learning         — shared model across AMRs
+  L3. Dynamic Event System       — blocked aisle / obstacle / failure
+  L4. Smart Task Allocator       — accept/reject by cost function
+  L5. Predictive Flow Optimizer  — congestion forecast, priority tokens,
+                                   backhaul pairing, zone handover
 """
 
 from __future__ import annotations
@@ -29,13 +33,20 @@ from core.config import (
     NUM_ROBOTS, TICK_RATE_HZ, MAX_TICKS, RANDOM_SEED,
     REPLANNING_INTERVAL, LOW_BATTERY_THRESHOLD,
 )
-from core.warehouse      import Warehouse
-from core.robot          import Robot, RobotState
+from core.warehouse         import Warehouse
+from core.robot             import Robot, RobotState
 from core.conflict_resolver import ConflictResolver
 from core.task_allocator    import TaskAllocator
 from comms.p2p_network      import PeerNode, InProcessBus
 from planning.cbs           import CBS
 from planning.astar         import astar
+
+# ── New advanced modules ───────────────────────────────────────────────────────
+from core.self_healing           import SelfHealingManager
+from core.federated_learning     import FederatedLearningCoordinator
+from core.dynamic_events         import DynamicEventSystem
+from core.smart_task_allocator   import SmartTaskAllocator
+from core.predictive_flow_optimizer import PredictiveFlowOptimizer
 
 logger = logging.getLogger(__name__)
 
@@ -81,12 +92,19 @@ class SimulationEngine:
         self.running   : bool = False
 
         # Performance tracking
-        self._task_completion_ticks: List[int] = []   # tick when each task done
+        self._task_completion_ticks: List[int] = []
         self._baseline_completion_ticks: List[int] = []
         self._collision_events: int = 0
 
         # Replanning schedule
-        self._replan_due: Dict[int, int] = {}   # robot_id → next replan tick
+        self._replan_due: Dict[int, int] = {}
+
+        # ── Advanced modules (Layer 1-5) ───────────────────────────────────────
+        self.self_healer  = SelfHealingManager(self.robots, self.warehouse, self.cbs)
+        self.fed_learning = FederatedLearningCoordinator(list(self.robots.keys()))
+        self.dyn_events   = DynamicEventSystem(self.warehouse, self.robots, seed=RANDOM_SEED)
+        self.smart_alloc  = SmartTaskAllocator(self.robots, self.warehouse)
+        self.flow_opt     = PredictiveFlowOptimizer(self.robots, self.warehouse)
 
     # ── Initialisation ─────────────────────────────────────────────────────────
 
@@ -149,8 +167,14 @@ class SimulationEngine:
     def _step(self) -> None:
         self.tick += 1
 
-        # 1. Allocate tasks to idle robots
-        self.allocator.tick(self.tick)
+        # L5 — Predictive Flow Optimizer tick (congestion + priority tokens + zones)
+        self.flow_opt.tick(self.tick)
+
+        # L3 — Dynamic Events (blocked aisles, obstacles, failures)
+        self.dyn_events.tick(self.tick, self.allocator)
+
+        # 1. Allocate tasks — use SmartTaskAllocator cost-based bidding
+        self._smart_allocate()
 
         # 2. Plan / replan paths
         self._plan_paths()
@@ -171,6 +195,13 @@ class SimulationEngine:
                     and robot.current_task is None):
                 self._route_to_charger(robot)
 
+        # L1 — Self-Healing (battery management + failure recovery)
+        self.self_healer.tick(self.tick, self.allocator)
+
+        # L2 — Federated Learning
+        congestion_map = dict(self.flow_opt.congestion.heatmap)
+        self.fed_learning.tick(self.tick, self.robots, congestion_map)
+
         # 5. P2P broadcasts
         self._broadcast_positions()
 
@@ -183,10 +214,53 @@ class SimulationEngine:
             try:
                 self.state_queue.put_nowait(snapshot)
             except asyncio.QueueFull:
-                pass  # dashboard consumer is slow; drop frame
+                pass
 
         if self.tick % 50 == 0:
             self._log_stats()
+
+    # ── Smart allocation (L4 + L5) ────────────────────────────────────────────
+
+    def _smart_allocate(self) -> None:
+        """
+        Combines base TaskAllocator task generation with SmartTaskAllocator
+        cost-based accept/reject and PredictiveFlowOptimizer zone/backhaul hints.
+        """
+        # Let base allocator generate new tasks and collect completions
+        self.allocator.tick(self.tick)
+
+        # Now do smart assignment for any still-unassigned tasks
+        unassigned = [t for t in self.allocator.pending_tasks
+                      if t.assigned_to is None and not t.completed]
+        idle_robots = [r for r in self.robots.values()
+                       if r.state == RobotState.IDLE
+                       and r.current_task is None
+                       and r.battery > LOW_BATTERY_THRESHOLD]
+
+        if not unassigned or not idle_robots:
+            return
+
+        for task in unassigned:
+            if not idle_robots:
+                break
+
+            # L5: Try zone-local or backhaul suggestion first
+            preferred = None
+            for robot in idle_robots:
+                suggested = self.flow_opt.suggest_task_for_robot(
+                    robot, unassigned, self.tick)
+                if suggested and suggested.task_id == task.task_id:
+                    preferred = robot
+                    break
+
+            candidates = ([preferred] + [r for r in idle_robots if r is not preferred]
+                          if preferred else idle_robots)
+
+            # L4: Cost-based accept/reject
+            winner = self.smart_alloc.best_robot_for_task(task, candidates, self.tick)
+            if winner:
+                winner.assign_task(task)
+                idle_robots = [r for r in idle_robots if r is not winner]
 
     # ── Path planning ──────────────────────────────────────────────────────────
 
@@ -351,14 +425,36 @@ class SimulationEngine:
     def _snapshot(self) -> Dict[str, Any]:
         # Always send full warehouse — client caches it after first receive
         wh = self.warehouse.to_dict()
+
+        # Drain events from all advanced modules
+        all_events = []
+        all_events += self._drain_events()
+        all_events += self.self_healer.drain_events()
+        all_events += self.fed_learning.drain_events()
+        all_events += self.dyn_events.drain_events()
+        all_events += self.smart_alloc.drain_events()
+        all_events += self.flow_opt.drain_events()
+
         return {
-            "tick"     : self.tick,
-            "mode"     : "stop_and_wait" if self.stop_and_wait else "cbs",
-            "robots"   : [r.to_dict() for r in self.robots.values()],
-            "tasks"    : self.allocator.all_tasks_for_dashboard(),
-            "stats"    : self._stats_dict(),
-            "warehouse": wh,
-            "events"   : self._drain_events(),
+            "tick"      : self.tick,
+            "mode"      : "stop_and_wait" if self.stop_and_wait else "cbs",
+            "robots"    : [r.to_dict() for r in self.robots.values()],
+            "tasks"     : self.allocator.all_tasks_for_dashboard(),
+            "stats"     : self._stats_dict(),
+            "warehouse" : wh,
+            "events"    : all_events,
+            # ── Advanced module data ──────────────────────────────────────
+            "self_healing": {
+                "events":  [],   # already in all_events
+                "health":  self.self_healer.health_summary(),
+            },
+            "federated_learning": self.fed_learning.dashboard_summary(),
+            "dynamic_events": {
+                "active":        self.dyn_events.active_summary(),
+                "blocked_cells": self.dyn_events.blocked_cells(),
+            },
+            "smart_alloc": self.smart_alloc.stats(),
+            "flow_optimizer": self.flow_opt.dashboard_data(),
         }
 
     def _drain_events(self) -> list:

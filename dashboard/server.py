@@ -114,7 +114,9 @@ async def _build_http_app() -> web.Application:
         return web.FileResponse(html_path)
 
     app.router.add_get("/", index)
-    app.router.add_static("/static", STATIC_DIR)
+    # Serve everything under static/ at root so scripts, vendor/, assets/ etc.
+    # are reachable without a /static prefix (e.g. /vendor/three/... works).
+    app.router.add_static("/", STATIC_DIR)
     return app
 
 
